@@ -1,0 +1,413 @@
+#!/usr/bin/env Rscript
+# Multi-hit Gene Analysis - Simplified R Version
+# Generates null distribution for parallel evolution analysis
+
+# Load required libraries
+library(tidyverse)
+
+# ============================================================================
+# USER INPUT PARAMETERS
+# ============================================================================
+## Read data
+setwd("~/Desktop/")
+# Input files
+observed_file <- "nonsyn_mutations.csv"  # CSV with columns: Replicate, Gene
+genome_ref_file <- "genome_genes.csv"      # CSV with columns: gene, length
+output_folder <- "parallel"
+
+
+# If no genome reference file, specify the expected number of genes in your genome
+# (e.g., ~4000-5000 for typical bacteria, ~6600 for yeast)
+expected_num_genes <- 4500  # Only used if genome_ref_file is empty
+
+# Simulation parameters
+num_simulations <- 10000   # Number of simulation replicates (100,000 recommended)
+
+# Analysis options
+use_gene_length <- FALSE    # Set to TRUE to weight by gene length (requires genome_ref_file)
+exclude_intergenic <- FALSE  # Set to TRUE to exclude intergenic mutations
+
+# ============================================================================
+# MAIN ANALYSIS
+# ============================================================================
+
+# Create output directory if it doesn't exist
+dir.create(output_folder, showWarnings = FALSE, recursive = TRUE)
+
+# Read observed mutation data
+cat("Reading observed mutation data...\n")
+observed_raw <- read_csv(observed_file, col_types = cols())
+
+# Clean gene names - remove arrows and extra annotations
+clean_gene_name <- function(gene) {
+  # Remove arrows (←, →)
+  gene <- gsub("[←→]", "", gene)
+  # Remove leading/trailing whitespace
+  gene <- trimws(gene)
+  # Split on "/" or ";" to handle intergenic regions
+  genes <- str_split(gene, "[/;]")[[1]]
+  genes <- trimws(genes)
+  # Keep only first gene or filter intergenic
+  return(genes[1])
+}
+
+observed_raw$Gene_clean <- sapply(observed_raw$Gene, clean_gene_name)
+
+# Filter out intergenic/coding regions if desired
+if (exclude_intergenic) {
+  cat("Filtering intergenic and coding regions...\n")
+  observed_data <- observed_raw %>%
+    filter(!grepl("coding|\\[|–", Gene)) %>%
+    filter(Gene_clean != "")
+} else {
+  observed_data <- observed_raw %>%
+    filter(Gene_clean != "")
+}
+
+cat(sprintf("Total mutations after filtering: %d\n", nrow(observed_data)))
+
+# Count how many times each gene was hit (across all replicates)
+gene_hits <- observed_data %>%
+  group_by(Gene_clean) %>%
+  summarise(hits = n(), .groups = "drop") %>%
+  arrange(desc(hits))
+
+cat("\nGenes hit multiple times:\n")
+multi_hit_genes <- gene_hits %>% filter(hits >= 2)
+print(multi_hit_genes, n = Inf)
+
+# Total number of mutations (for simulation)
+num_mutations <- nrow(observed_data)
+cat(sprintf("\nTotal mutations to simulate: %d\n", num_mutations))
+
+# Number of observed multi-hit genes
+observed_multihit_count <- nrow(multi_hit_genes)
+cat(sprintf("Observed multi-hit genes (≥2): %d\n", observed_multihit_count))
+
+# Load genome reference to get all genes
+cat("\nLoading genome gene information...\n")
+
+# Option 1: Load from file if provided
+if (genome_ref_file != "" && file.exists(genome_ref_file)) {
+  cat("Reading genome reference file...\n")
+  all_genes_data <- read_csv(genome_ref_file, col_types = cols())
+  all_genes <- all_genes_data$gene
+  gene_lengths <- all_genes_data$length
+  cat(sprintf("Loaded %d genes from reference file\n", length(all_genes)))
+  
+  # Option 2: Generate from observed data if no reference file
+} else {
+  cat("No genome reference file provided.\n")
+  cat("Generating gene list from observed mutations + expected genome size...\n")
+  
+  # Get unique genes from observed data
+  observed_unique_genes <- unique(observed_data$Gene_clean)
+  num_observed_genes <- length(observed_unique_genes)
+  
+  cat(sprintf("Found %d unique genes in observed data\n", num_observed_genes))
+  
+  # Estimate total genes (observed + unobserved)
+  if (expected_num_genes < num_observed_genes) {
+    warning(sprintf("expected_num_genes (%d) is less than observed unique genes (%d). Using observed count + 20%%.",
+                    expected_num_genes, num_observed_genes))
+    expected_num_genes <- round(num_observed_genes * 1.2)
+  }
+  
+  num_additional_genes <- expected_num_genes - num_observed_genes
+  
+  cat(sprintf("Assuming %d total genes in genome\n", expected_num_genes))
+  cat(sprintf("Adding %d hypothetical genes not observed in your data\n", num_additional_genes))
+  
+  # Create gene list: observed genes + dummy genes
+  all_genes <- c(observed_unique_genes, 
+                 paste0("GENE_", sprintf("%05d", 1:num_additional_genes)))
+  
+  # Assign uniform lengths (since we don't have real data)
+  gene_lengths <- rep(1000, length(all_genes))  # Arbitrary length
+  
+  cat("Note: Using uniform gene lengths. For accurate length-weighted analysis,\n")
+  cat("      provide a genome reference file with actual gene lengths.\n")
+  
+  if (use_gene_length) {
+    warning("use_gene_length is TRUE but no gene lengths available. Switching to uniform sampling.")
+    use_gene_length <- FALSE
+  }
+}
+
+cat(sprintf("Total genes for simulation: %d\n", length(all_genes)))
+
+# Calculate sampling weights
+if (use_gene_length) {
+  cat("Using gene length-weighted sampling\n")
+  weights <- gene_lengths / sum(gene_lengths)
+} else {
+  cat("Using uniform sampling (not weighted by gene length)\n")
+  weights <- rep(1/length(all_genes), length(all_genes))
+}
+
+# ============================================================================
+# RUN SIMULATIONS
+# ============================================================================
+
+cat(sprintf("\nRunning %d simulations with %d mutations each...\n", 
+            num_simulations, num_mutations))
+cat("This may take a few minutes...\n\n")
+
+set.seed(42)  # For reproducibility
+
+# Run simulations
+simulation_results <- vector("list", num_simulations)
+
+pb <- txtProgressBar(min = 0, max = num_simulations, style = 3)
+for (i in 1:num_simulations) {
+  # Sample genes with replacement (simulating random mutations)
+  sampled_genes <- sample(all_genes, size = num_mutations, 
+                          replace = TRUE, prob = weights)
+  
+  # Count hits per gene
+  gene_counts <- table(sampled_genes)
+  simulation_results[[i]] <- gene_counts
+  
+  if (i %% 1000 == 0) setTxtProgressBar(pb, i)
+}
+close(pb)
+
+cat("\nSimulations complete!\n")
+
+# ============================================================================
+# ANALYZE RESULTS
+# ============================================================================
+
+cat("\nAnalyzing simulation results...\n")
+
+# Find maximum number of hits across all simulations
+max_hits <- max(sapply(simulation_results, function(x) ifelse(length(x) > 0, max(x), 0)))
+
+# OPTIMIZED: Convert simulation results to a more efficient format
+cat("Processing simulation data...\n")
+
+# Create a matrix: rows = genes, columns = max_hits and hit counts
+gene_max_hits <- rep(0, length(all_genes))
+names(gene_max_hits) <- all_genes
+
+# Initialize hit count matrix
+hit_count_matrix <- matrix(0, nrow = length(all_genes), ncol = max_hits + 1)
+rownames(hit_count_matrix) <- all_genes
+colnames(hit_count_matrix) <- paste0("hit_", 0:max_hits, "_times")
+
+# Process each simulation once
+for (sim in simulation_results) {
+  # Update max hits for genes in this simulation
+  for (gene_name in names(sim)) {
+    hit_count <- as.numeric(sim[gene_name])
+    if (hit_count > gene_max_hits[gene_name]) {
+      gene_max_hits[gene_name] <- hit_count
+    }
+    # Update hit count
+    hit_count_matrix[gene_name, hit_count + 1] <- hit_count_matrix[gene_name, hit_count + 1] + 1
+  }
+  
+  # Genes not in this simulation get a "0 hit"
+  missing_genes <- setdiff(all_genes, names(sim))
+  hit_count_matrix[missing_genes, 1] <- hit_count_matrix[missing_genes, 1] + 1
+}
+
+# Convert to data frame
+gene_hit_counts <- data.frame(
+  gene = all_genes,
+  as.data.frame(hit_count_matrix),
+  max_null_hits = gene_max_hits,
+  stringsAsFactors = FALSE
+)
+
+# Add observed frequencies
+gene_hit_counts$observed_hits <- sapply(all_genes, function(gene) {
+  idx <- which(gene_hits$Gene_clean == gene)
+  if (length(idx) > 0) {
+    return(gene_hits$hits[idx])
+  } else {
+    return(0)
+  }
+})
+
+# ============================================================================
+# CALCULATE SUMMARY STATISTICS
+# ============================================================================
+
+cat("Calculating summary statistics...\n")
+
+# Calculate statistics for genes hit X times
+hit_stats <- data.frame(times_hit = 0:max_hits)
+
+for (i in 0:max_hits) {
+  counts_across_sims <- sapply(simulation_results, function(sim) {
+    if (i == 0) {
+      return(length(all_genes) - length(sim))
+    } else {
+      return(sum(sim == i))
+    }
+  })
+  
+  hit_stats$min[i+1] <- min(counts_across_sims)
+  hit_stats$max[i+1] <- max(counts_across_sims)
+  hit_stats$mean[i+1] <- mean(counts_across_sims)
+  hit_stats$sd[i+1] <- sd(counts_across_sims)
+  
+  # 95% Confidence Interval
+  z_score <- qnorm(0.975)  # 95% CI
+  se <- sd(counts_across_sims) / sqrt(num_simulations)
+  hit_stats$ci_lower[i+1] <- hit_stats$mean[i+1] - z_score * se
+  hit_stats$ci_upper[i+1] <- hit_stats$mean[i+1] + z_score * se
+  
+  # Calculate p-value (proportion of simulations with this many or more genes)
+  hit_stats$observed[i+1] <- sum(gene_hits$hits == i)
+}
+
+# Count expected multi-hit genes in null distribution
+expected_multihit_per_sim <- sapply(simulation_results, function(sim) {
+  sum(sim >= 2)
+})
+
+expected_multihit_mean <- mean(expected_multihit_per_sim)
+expected_multihit_sd <- sd(expected_multihit_per_sim)
+expected_multihit_ci_lower <- quantile(expected_multihit_per_sim, 0.025)
+expected_multihit_ci_upper <- quantile(expected_multihit_per_sim, 0.975)
+
+# Calculate p-value: proportion of simulations with as many or more multi-hit genes
+p_value <- sum(expected_multihit_per_sim >= observed_multihit_count) / num_simulations
+
+# ============================================================================
+# DISPLAY RESULTS
+# ============================================================================
+
+cat("\n============================================\n")
+cat("SUMMARY RESULTS\n")
+cat("============================================\n")
+cat(sprintf("Total mutations analyzed: %d\n", num_mutations))
+cat(sprintf("Total genes in genome: %d\n", length(all_genes)))
+cat(sprintf("\nObserved multi-hit genes (≥2): %d\n", observed_multihit_count))
+cat(sprintf("Expected multi-hit genes (null): %.2f (SD: %.2f)\n", 
+            expected_multihit_mean, expected_multihit_sd))
+cat(sprintf("95%% CI for null expectation: %.2f - %.2f\n", 
+            expected_multihit_ci_lower, expected_multihit_ci_upper))
+cat(sprintf("\nP-value: %.4f\n", p_value))
+
+if (p_value < 0.05) {
+  cat("\n*** SIGNIFICANT: More multi-hit genes than expected by chance! ***\n")
+  cat("This suggests positive selection and parallel evolution.\n")
+} else {
+  cat("\nResult: Multi-hit genes within expected range (not significant)\n")
+}
+
+cat("\nTop multi-hit genes:\n")
+print(head(multi_hit_genes, 10))
+
+# ============================================================================
+# SAVE RESULTS
+# ============================================================================
+
+cat("\nSaving results...\n")
+
+# 1. Save summary statistics
+write_csv(hit_stats, 
+          file.path(output_folder, 
+                    sprintf("summary_stats_%dmuts_%dsims.csv", 
+                            num_mutations, num_simulations)))
+
+# 2. Save multi-hit gene summary
+multihit_summary <- data.frame(
+  metric = c("Total_mutations", "Observed_multihit_genes", 
+             "Expected_multihit_mean", "Expected_multihit_SD",
+             "CI_lower", "CI_upper", "P_value"),
+  value = c(num_mutations, observed_multihit_count, 
+            expected_multihit_mean, expected_multihit_sd,
+            expected_multihit_ci_lower, expected_multihit_ci_upper, p_value)
+)
+write_csv(multihit_summary,
+          file.path(output_folder, "multihit_summary.csv"))
+
+# 3. Save observed gene hits with details
+observed_genes_detailed <- gene_hits %>%
+  left_join(gene_hit_counts %>% 
+              select(gene, max_null_hits), 
+            by = c("Gene_clean" = "gene")) %>%
+  mutate(
+    significant = hits > max_null_hits,
+    enrichment = hits / (max_null_hits + 0.1)
+  ) %>%
+  arrange(desc(hits))
+
+write_csv(observed_genes_detailed, 
+          file.path(output_folder, 
+                    sprintf("observed_genes_detailed_%dmuts_%dsims.csv", 
+                            num_mutations, num_simulations)))
+
+# 4. Save all genes with simulation results
+write_csv(gene_hit_counts, 
+          file.path(output_folder, 
+                    sprintf("all_genes_simulation_%dmuts_%dsims.csv", 
+                            num_mutations, num_simulations)))
+
+# 5. Save distribution of multi-hit counts from simulations
+multihit_distribution <- data.frame(
+  num_multihit_genes = expected_multihit_per_sim
+)
+write_csv(multihit_distribution,
+          file.path(output_folder, "null_multihit_distribution.csv"))
+
+# ============================================================================
+# CREATE VISUALIZATIONS
+# ============================================================================
+
+cat("Creating visualizations...\n")
+
+# Plot 1: Expected vs Observed hit distribution
+plot_data <- hit_stats %>%
+  filter(times_hit >= 1 & times_hit <= min(max_hits, 6)) %>%
+  mutate(times_hit_factor = factor(times_hit))
+
+p1 <- ggplot(plot_data, aes(x = times_hit_factor, y = mean)) +
+  geom_col(fill = "skyblue", alpha = 0.7) +
+  geom_errorbar(aes(ymin = ci_lower, ymax = ci_upper), width = 0.2) +
+  geom_point(aes(y = observed), color = "red", size = 4, shape = 18) +
+  labs(title = "Multi-hit Gene Analysis",
+       subtitle = sprintf("%d mutations, %d simulations (p = %.4f)", 
+                          num_mutations, num_simulations, p_value),
+       x = "Number of hits per gene",
+       y = "Number of genes",
+       caption = "Blue bars: Expected (95% CI) | Red diamonds: Observed") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+ggsave(file.path(output_folder, "multihit_comparison.png"), 
+       p1, width = 10, height = 6, dpi = 300)
+
+# Plot 2: Distribution of multi-hit gene counts from simulations
+p2 <- ggplot(multihit_distribution, aes(x = num_multihit_genes)) +
+  geom_histogram(bins = 50, fill = "skyblue", alpha = 0.7, color = "black") +
+  geom_vline(xintercept = observed_multihit_count, color = "red", 
+             linetype = "dashed", size = 1) +
+  geom_vline(xintercept = expected_multihit_ci_lower, color = "blue", 
+             linetype = "dotted", size = 0.8) +
+  geom_vline(xintercept = expected_multihit_ci_upper, color = "blue", 
+             linetype = "dotted", size = 0.8) +
+  annotate("text", x = observed_multihit_count, y = Inf, 
+           label = sprintf("Observed\n(%d)", observed_multihit_count), 
+           vjust = 2, color = "red", fontface = "bold") +
+  labs(title = "Null Distribution of Multi-hit Genes",
+       subtitle = sprintf("Expected: %.1f (95%% CI: %.1f - %.1f)", 
+                          expected_multihit_mean, 
+                          expected_multihit_ci_lower, 
+                          expected_multihit_ci_upper),
+       x = "Number of multi-hit genes",
+       y = "Frequency (out of 100,000 simulations)") +
+  theme_minimal() +
+  theme(plot.title = element_text(face = "bold", size = 14))
+
+ggsave(file.path(output_folder, "null_distribution.png"), 
+       p2, width = 10, height = 6, dpi = 300)
+
+cat("\n============================================\n")
+cat("Analysis complete! Results saved to:\n")
+cat(output_folder, "\n")
+cat("============================================\n")
