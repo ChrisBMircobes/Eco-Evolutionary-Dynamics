@@ -1,0 +1,646 @@
+#!/bin/bash
+#SBATCH --job-name=eco_evo_multi
+#SBATCH --array=1-100
+#SBATCH --mail-type=ALL
+#SBATCH --mail-user=christopher.blake@monash.edu
+#SBATCH --time=2-00:00:00
+#SBATCH --mem-per-cpu=4G
+#SBATCH --cpus-per-task=1
+#SBATCH --mail-type=ALL
+
+# Create logs directory
+mkdir -p logs
+
+# Load modules
+module purge
+module load R/4.3.3
+
+# Set unique seed for each array job
+SEED=$((1000 + SLURM_ARRAY_TASK_ID))
+REPLICATE_ID=$(printf "%03d" $SLURM_ARRAY_TASK_ID)
+
+# Create output directory for this replicate
+OUTPUT_DIR="replicate_${REPLICATE_ID}"
+mkdir -p $OUTPUT_DIR
+cd $OUTPUT_DIR
+
+# Export parameters for R script
+export SIMULATION_SEED=$SEED
+export REPLICATE_ID=$REPLICATE_ID
+export NSPP=10
+export GENS=1000
+export SAVE_PLOTS=FALSE
+
+echo "========================================="
+echo "Array Job: $SLURM_ARRAY_JOB_ID"
+echo "Task ID: $SLURM_ARRAY_TASK_ID"
+echo "Replicate: $REPLICATE_ID"
+echo "Seed: $SEED"
+echo "Node: $SLURMD_NODENAME"
+echo "Start Time: $(date)"
+echo "========================================="
+
+# Create the R script inline
+cat << 'EOF' > eco_evo_single_run.R
+# ===========================================================
+# Single Run Eco-evolutionary Simulation for Meta-Analysis
+# Enhanced with Aggressive/Defensive Alpha Mutations
+# CORRECTED VERSION - Properly saves all data for meta-analysis
+# ===========================================================
+
+suppressPackageStartupMessages({
+  library(ggplot2)
+  library(dplyr)
+  library(tidyr)
+  library(purrr)
+  library(Matrix)
+  library(scales)
+  library(viridis)
+})
+
+# Get parameters from environment
+REPLICATE_ID <- Sys.getenv("REPLICATE_ID", "001")
+seed_value <- as.numeric(Sys.getenv("SIMULATION_SEED", "123"))
+save_plots <- as.logical(Sys.getenv("SAVE_PLOTS", "FALSE"))
+
+set.seed(seed_value)
+cat("=== Replicate", REPLICATE_ID, "- Seed:", seed_value, "===\n")
+
+# Parameters
+NSPP   <- as.numeric(Sys.getenv("NSPP", "10"))
+GENS   <- as.numeric(Sys.getenv("GENS", "1000"))
+
+# Baseline species parameters  
+N0 <- rep(5e3, NSPP)
+K0 <- c(8e4, 1e4, 6e4, 4.5e4, 5.5e4, 3e4, 5.8e4, 3.5e4, 2.2e4, 6.8e4)[1:NSPP]
+r0 <- c(0.08, 0.06, 0.10, 0.07, 0.09, 0.05, 0.08, 0.06, 0.07, 0.08)[1:NSPP]
+mu <- rep(2e-4, NSPP)
+
+# Mutation parameters
+r_effect_sd <- 0.3
+K_effect_sd <- 0.4
+alpha_effect_sd <- 0.5
+max_growth <- 0.5
+
+# Interaction matrix
+set.seed(12345)  # Fixed seed for alpha matrix only
+alpha0 <- matrix(0, nrow = NSPP, ncol = NSPP)
+for (i in 1:NSPP) {
+  for (j in 1:NSPP) {
+    if (i == j) alpha0[i, j] <- 1.0
+    else alpha0[i, j] <- runif(1, 0.1, 0.6)
+  }
+}
+set.seed(seed_value)  # Restore original seed for rest of simulation
+
+# ENHANCED: Utility functions with aggressive/defensive alpha system
+get_clone_alpha <- function(clone_i, clone_j) {
+  base_alpha <- alpha0[clone_i$species, clone_j$species]
+  
+  # Clone i's aggressive modification (how i affects j)
+  aggressive_mod <- clone_i$alpha_effects_out[clone_j$species]
+  
+  # Clone j's defensive modification (how j resists i)
+  defensive_mod <- clone_j$alpha_effects_in[clone_i$species]
+  
+  # Combine: aggressive increases competition, defensive decreases it
+  alpha_ij <- base_alpha * (1 + aggressive_mod - defensive_mod)
+  
+  return(max(0, alpha_ij))
+}
+
+generate_mutant <- function(parent_clone, generation, clone_counter, mutation_events) {
+  clone_counter <- clone_counter + 1
+  channel <- sample(c("r", "K", "alpha"), size = 1, prob = c(0.6, 0.2, 0.2))
+  
+  mutant <- parent_clone
+  mutant$id <- paste0("sp", parent_clone$species, "_mut", clone_counter)
+  mutant$N <- 1
+  mutant$birth_gen <- generation
+  mutant$parent_id <- parent_clone$id
+  
+  delta_r_new <- 0
+  delta_K_new <- 0
+  changed_species <- NA
+  alpha_mutation_type <- NA
+  alpha_effect_value <- 0
+  
+  if (channel == "r") {
+    delta_r_new <- rnorm(1, 0, r_effect_sd)
+    mutant$r <- max(0.001, parent_clone$r * (1 + delta_r_new))
+    mutant$delta_r <- parent_clone$delta_r + delta_r_new
+    mutant$mutation_type <- "Evo_r"
+    
+  } else if (channel == "K") {
+    delta_K_new <- rnorm(1, 0, K_effect_sd)
+    mutant$K <- max(1, parent_clone$K * (1 + delta_K_new))
+    mutant$delta_K <- parent_clone$delta_K + delta_K_new
+    mutant$mutation_type <- "Evo_K"
+    
+  } else if (channel == "alpha") {
+    # Get all other species (not self)
+    other_species <- setdiff(1:NSPP, parent_clone$species)
+    
+    if (length(other_species) > 0) {
+        # Single effect value applied to ALL other species
+        alpha_effect_value <- rnorm(1, 0, alpha_effect_sd)
+        
+        # Choose between aggressive and defensive mutation
+        alpha_mutation_type <- sample(c("aggressive", "defensive"), size = 1, prob = c(0.2, 0.8))
+        
+        if (alpha_mutation_type == "aggressive") {
+            # AGGRESSIVE: Increase competitive effect ON all other species
+            mutant$alpha_effects_out[other_species] <- parent_clone$alpha_effects_out[other_species] + alpha_effect_value
+            mutant$delta_alpha_out[other_species] <- parent_clone$delta_alpha_out[other_species] + alpha_effect_value
+            mutant$mutation_type <- "Niche_shift_aggressive_global"
+            
+        } else if (alpha_mutation_type == "defensive") {
+            # DEFENSIVE: Reduce competitive effect FROM all other species  
+            mutant$alpha_effects_in[other_species] <- parent_clone$alpha_effects_in[other_species] + alpha_effect_value
+            mutant$delta_alpha_in[other_species] <- parent_clone$delta_alpha_in[other_species] + alpha_effect_value
+            mutant$mutation_type <- "Niche_shift_defensive_global"
+        }
+        
+        # For tracking purposes, record as "global" change
+        changed_species <- -1  # Use -1 to indicate "all other species"
+    }
+  }
+  
+  # FIXED: Include replicate ID in mutation record
+  mutation_record <- data.frame(
+    gen = generation,
+    species = parent_clone$species,
+    parent_id = parent_clone$id,
+    mutant_id = mutant$id,
+    channel = channel,
+    delta_r = delta_r_new,
+    delta_K = delta_K_new,
+    changed_alpha_species = ifelse(is.na(changed_species), NA, changed_species),
+    alpha_mutation_type = ifelse(is.na(alpha_mutation_type), NA, alpha_mutation_type),
+    delta_alpha_effect = alpha_effect_value,
+    replicate = REPLICATE_ID,  # ADDED: Replicate ID
+    stringsAsFactors = FALSE
+  )
+  mutation_events <- rbind(mutation_events, mutation_record)
+  
+  return(list(mutant = mutant, clone_counter = clone_counter, mutation_events = mutation_events))
+}
+
+update_clone_populations <- function(clones, generation) {
+  n_clones <- length(clones)
+  if (n_clones == 0) return(list())
+  
+  growth_rates <- numeric(n_clones)
+  
+  for (i in 1:n_clones) {
+    clone_i <- clones[[i]]
+    if (clone_i$N <= 0) {
+      growth_rates[i] <- -Inf
+      next
+    }
+    
+    competitive_load <- 0
+    for (j in 1:n_clones) {
+      if (i != j) {
+        clone_j <- clones[[j]]
+        alpha_ij <- get_clone_alpha(clone_i, clone_j)
+        competitive_load <- competitive_load + alpha_ij * clone_j$N
+      }
+    }
+    
+    competitive_load <- competitive_load + clone_i$N
+    growth_rate <- clone_i$r * (1 - competitive_load / clone_i$K)
+    growth_rates[i] <- pmax(-max_growth, pmin(max_growth, growth_rate))
+  }
+  
+  new_clones <- list()
+  for (i in 1:n_clones) {
+    clone <- clones[[i]]
+    expected_N <- clone$N * exp(growth_rates[i])
+    
+    if (expected_N <= 0) {
+      new_N <- 0
+    } else if (expected_N < 1) {
+      new_N <- rbinom(1, 1, expected_N)
+    } else {
+      new_N <- rpois(1, min(expected_N, 1e6))
+    }
+    
+    if (new_N > 0) {
+      clone$N <- new_N
+      new_clones[[length(new_clones) + 1]] <- clone
+    }
+  }
+  
+  return(new_clones)
+}
+
+apply_mutations <- function(clones, generation, clone_counter, mutation_events) {
+  new_clones <- clones
+  
+  for (i in seq_along(clones)) {
+    clone <- clones[[i]]
+    species_mu <- mu[clone$species]
+    n_mutations <- rpois(1, species_mu * clone$N)
+    
+    for (m in seq_len(n_mutations)) {
+      mut_result <- generate_mutant(clone, generation, clone_counter, mutation_events)
+      mutant <- mut_result$mutant
+      clone_counter <- mut_result$clone_counter
+      mutation_events <- mut_result$mutation_events
+      new_clones[[length(new_clones) + 1]] <- mutant
+    }
+  }
+  
+  return(list(clones = new_clones, clone_counter = clone_counter, mutation_events = mutation_events))
+}
+
+# Function to run simulation with or without mutations
+run_simulation <- function(with_mutations = TRUE) {
+  # Initialize
+  clones <- list()
+  clone_counter <- 0
+  mutation_events <- data.frame()
+  community_states <- data.frame()
+  all_clone_trajectories <- data.frame()
+  
+  # ENHANCED: Initialize ancestral clones with aggressive/defensive alpha effects
+  for (i in 1:NSPP) {
+    clone_counter <- clone_counter + 1
+    ancestral_clone <- list(
+      id = paste0("sp", i, "_ancestor"),
+      species = i,
+      N = as.numeric(N0[i]),
+      birth_gen = 0,
+      parent_id = "ancestor",
+      r = r0[i],
+      K = K0[i], 
+      
+      # NEW: Separate aggressive and defensive alpha effects
+      alpha_effects_out = rep(0, NSPP),  # How this clone affects others (aggressive)
+      alpha_effects_in = rep(0, NSPP),   # How others affect this clone (defensive)
+      
+      delta_r = 0,
+      delta_K = 0,
+      delta_alpha_out = rep(0, NSPP),    # Track cumulative aggressive changes
+      delta_alpha_in = rep(0, NSPP),     # Track cumulative defensive changes
+      mutation_type = "ancestor"
+    )
+    clones[[clone_counter]] <- ancestral_clone
+  }
+  
+  # Main simulation loop
+  for (t in 1:GENS) {
+    clones <- clones[sapply(clones, function(c) c$N > 0)]
+    
+    if (length(clones) == 0) {
+      cat("Total extinction at generation", t, ifelse(with_mutations, "(with mutations)", "(no mutations)"), "\n")
+      break
+    }
+    
+    # Ecological dynamics
+    clones <- update_clone_populations(clones, t)
+    
+    # Apply mutations (only if with_mutations = TRUE)
+    if (with_mutations && length(clones) > 0) {
+      mut_result <- apply_mutations(clones, t, clone_counter, mutation_events)
+      clones <- mut_result$clones
+      clone_counter <- mut_result$clone_counter
+      mutation_events <- mut_result$mutation_events
+    }
+    
+    # Remove extinct clones
+    clones <- clones[sapply(clones, function(c) c$N > 0)]
+    
+    # Record data every 10 generations
+    if (t %% 10 == 0) {
+      species_totals <- numeric(NSPP)
+      for (clone in clones) {
+        species_totals[clone$species] <- species_totals[clone$species] + clone$N
+      }
+      
+      total_community <- sum(species_totals)
+      if (total_community > 0) {
+        community_record <- data.frame(
+          gen = t,
+          species = 1:NSPP,
+          N = species_totals,
+          freq = species_totals / total_community,
+          extinct = species_totals == 0,
+          replicate = REPLICATE_ID,  # ADDED: Replicate ID
+          stringsAsFactors = FALSE
+        )
+        community_states <- rbind(community_states, community_record)
+      }
+      
+      # ENHANCED: Track individual clone data with replicate ID
+      clone_data <- data.frame()
+      for (clone in clones) {
+        species_total <- sum(sapply(clones[sapply(clones, function(c) c$species == clone$species)], 
+                                   function(c) c$N))
+        
+        clone_record <- data.frame(
+          gen = t,
+          species = clone$species,
+          clone_id = clone$id,
+          clone_N = clone$N,
+          species_total_N = species_total,
+          clone_frequency_in_species = clone$N / species_total,
+          birth_gen = clone$birth_gen,
+          mutation_type = clone$mutation_type,
+          delta_r = clone$delta_r,
+          delta_K = clone$delta_K,
+          r_value = clone$r,
+          K_value = clone$K,
+          replicate = REPLICATE_ID,  # ADDED: Replicate ID
+          stringsAsFactors = FALSE
+        )
+        clone_data <- rbind(clone_data, clone_record)
+      }
+      
+      # Store this data
+      all_clone_trajectories <- rbind(all_clone_trajectories, clone_data)
+    }
+    
+    # Progress every 100 generations
+    if (t %% 100 == 0) {
+      n_clones <- length(clones)
+      total_pop <- sum(sapply(clones, function(c) c$N))
+      cat(sprintf("%s Gen %d - Clones: %d - Pop: %.2e\n", 
+                  ifelse(with_mutations, "MUT", "ECO"), t, n_clones, total_pop))
+    }
+  }
+  
+  return(list(
+    community_states = community_states,
+    mutation_events = mutation_events,
+    final_clones = clones,
+    all_clone_trajectories = all_clone_trajectories
+  ))
+}
+
+# Extract final outcomes function (ENHANCED with replicate ID)
+extract_final_outcomes <- function(sim_result, scenario_name) {
+  community_data <- sim_result$community_states
+  
+  if (nrow(community_data) == 0) {
+    # All extinct
+    final_outcomes <- data.frame(
+      replicate = REPLICATE_ID,
+      scenario = scenario_name,
+      species = 1:NSPP,
+      final_frequency = 0,
+      final_abundance = 0,
+      extinct = TRUE,
+      extinction_generation = 0,
+      max_frequency = 0,
+      max_abundance = 0,
+      initial_abundance = N0,
+      initial_K = K0,
+      initial_r = r0,
+      mutation_rate = mu,
+      stringsAsFactors = FALSE
+    )
+  } else {
+    # Get final state
+    final_gen <- max(community_data$gen)
+    final_state <- community_data %>% filter(gen == final_gen)
+    
+    # Get maximum values over time
+    max_values <- community_data %>%
+      group_by(species) %>%
+      summarise(
+        max_frequency = max(freq, na.rm = TRUE),
+        max_abundance = max(N, na.rm = TRUE),
+        extinction_generation = ifelse(any(extinct), min(gen[extinct]), NA),
+        .groups = "drop"
+      )
+    
+    final_outcomes <- data.frame(
+      replicate = REPLICATE_ID,
+      scenario = scenario_name,
+      species = final_state$species,
+      final_frequency = final_state$freq,
+      final_abundance = final_state$N,
+      extinct = final_state$extinct,
+      extinction_generation = max_values$extinction_generation[match(final_state$species, max_values$species)],
+      max_frequency = max_values$max_frequency[match(final_state$species, max_values$species)],
+      max_abundance = max_values$max_abundance[match(final_state$species, max_values$species)],
+      initial_abundance = N0[final_state$species],
+      initial_K = K0[final_state$species],
+      initial_r = r0[final_state$species],
+      mutation_rate = mu[final_state$species],
+      stringsAsFactors = FALSE
+    )
+  }
+  
+  return(final_outcomes)
+}
+
+# ===========================================
+# RUN BOTH SIMULATIONS
+# ===========================================
+
+cat("\n=== RUNNING WITH MUTATIONS ===\n")
+sim_with_mut <- run_simulation(with_mutations = TRUE)
+
+cat("\n=== RUNNING WITHOUT MUTATIONS ===\n")  
+# Reset seed to same value for direct comparison
+set.seed(seed_value)
+sim_no_mut <- run_simulation(with_mutations = FALSE)
+
+# Extract outcomes
+outcomes_with_mut <- extract_final_outcomes(sim_with_mut, "with_mutations")
+outcomes_no_mut <- extract_final_outcomes(sim_no_mut, "no_mutations")
+
+# Combine results
+all_outcomes <- rbind(outcomes_with_mut, outcomes_no_mut)
+
+# Add simulation metadata
+simulation_summary <- data.frame(
+  replicate = REPLICATE_ID,
+  seed = seed_value,
+  total_species = NSPP,
+  total_generations = GENS,
+  extinctions_with_mut = sum(outcomes_with_mut$extinct),
+  extinctions_no_mut = sum(outcomes_no_mut$extinct),
+  total_mutations = nrow(sim_with_mut$mutation_events),
+  final_clones_with_mut = length(sim_with_mut$final_clones),
+  final_clones_no_mut = length(sim_no_mut$final_clones),
+  simulation_date = Sys.time(),
+  stringsAsFactors = FALSE
+)
+
+# ENHANCED: Calculate mutation type summaries
+if (nrow(sim_with_mut$mutation_events) > 0) {
+  mutation_summary <- sim_with_mut$mutation_events %>%
+    count(channel, alpha_mutation_type) %>%
+    pivot_wider(names_from = c(channel, alpha_mutation_type), values_from = n, values_fill = 0, names_sep = "_")
+  
+  # Add to simulation summary
+  simulation_summary <- cbind(simulation_summary, mutation_summary)
+}
+
+# Calculate diversity indices
+calculate_diversity <- function(frequencies) {
+  alive_freqs <- frequencies[frequencies > 0]
+  if (length(alive_freqs) == 0) return(c(richness = 0, shannon = 0, simpson = 0))
+  
+  richness <- length(alive_freqs)
+  shannon <- -sum(alive_freqs * log(alive_freqs))
+  simpson <- sum(alive_freqs^2)
+  
+  return(c(richness = richness, shannon = shannon, simpson = simpson))
+}
+
+diversity_with_mut <- calculate_diversity(outcomes_with_mut$final_frequency)
+diversity_no_mut <- calculate_diversity(outcomes_no_mut$final_frequency)
+
+diversity_summary <- data.frame(
+  replicate = REPLICATE_ID,
+  scenario = c("with_mutations", "no_mutations"),
+  richness = c(diversity_with_mut["richness"], diversity_no_mut["richness"]),
+  shannon_diversity = c(diversity_with_mut["shannon"], diversity_no_mut["shannon"]),
+  simpson_index = c(diversity_with_mut["simpson"], diversity_no_mut["simpson"]),
+  stringsAsFactors = FALSE
+)
+
+# ===========================================
+# SAVE RESULTS - CORRECTED VERSION
+# ===========================================
+
+# Save key results files
+write.csv(all_outcomes, paste0("outcomes_", REPLICATE_ID, ".csv"), row.names = FALSE)
+write.csv(simulation_summary, paste0("summary_", REPLICATE_ID, ".csv"), row.names = FALSE)
+write.csv(diversity_summary, paste0("diversity_", REPLICATE_ID, ".csv"), row.names = FALSE)
+
+# FIXED: Save interaction matrix with replicate ID and proper structure
+alpha_df <- as.data.frame(alpha0)
+colnames(alpha_df) <- paste0("target_sp_", 1:NSPP)
+alpha_df$focal_species <- 1:NSPP
+alpha_df$replicate <- REPLICATE_ID  # ADDED: Replicate ID
+write.csv(alpha_df, paste0("alpha_matrix_", REPLICATE_ID, ".csv"), row.names = FALSE)
+
+# FIXED: Save time series data with replicate IDs
+if (nrow(sim_with_mut$community_states) > 0) {
+  timeseries_with_mut <- sim_with_mut$community_states
+  if (!"replicate" %in% colnames(timeseries_with_mut)) {
+    timeseries_with_mut$replicate <- REPLICATE_ID
+  }
+  write.csv(timeseries_with_mut, paste0("timeseries_with_mut_", REPLICATE_ID, ".csv"), row.names = FALSE)
+}
+
+if (nrow(sim_no_mut$community_states) > 0) {
+  timeseries_no_mut <- sim_no_mut$community_states
+  if (!"replicate" %in% colnames(timeseries_no_mut)) {
+    timeseries_no_mut$replicate <- REPLICATE_ID
+  }
+  write.csv(timeseries_no_mut, paste0("timeseries_no_mut_", REPLICATE_ID, ".csv"), row.names = FALSE)
+}
+
+# FIXED: Save mutation events with replicate ID (already added above)
+if (nrow(sim_with_mut$mutation_events) > 0) {
+  mutation_data <- sim_with_mut$mutation_events
+  if (!"replicate" %in% colnames(mutation_data)) {
+    mutation_data$replicate <- REPLICATE_ID
+  }
+  write.csv(mutation_data, paste0("mutations_", REPLICATE_ID, ".csv"), row.names = FALSE)
+}
+
+# NEW: Save clone trajectories for meta-analysis (THIS WAS MISSING!)
+if (nrow(sim_with_mut$all_clone_trajectories) > 0) {
+  trajectory_data <- sim_with_mut$all_clone_trajectories
+  if (!"replicate" %in% colnames(trajectory_data)) {
+    trajectory_data$replicate <- REPLICATE_ID
+  }
+  write.csv(trajectory_data, paste0("clone_trajectories_", REPLICATE_ID, ".csv"), row.names = FALSE)
+}
+
+# ALSO save no-mutation trajectories for comparison
+if (nrow(sim_no_mut$all_clone_trajectories) > 0) {
+  trajectory_no_mut <- sim_no_mut$all_clone_trajectories
+  trajectory_no_mut$scenario <- "no_mutations"
+  if (!"replicate" %in% colnames(trajectory_no_mut)) {
+    trajectory_no_mut$replicate <- REPLICATE_ID
+  }
+  write.csv(trajectory_no_mut, paste0("clone_trajectories_no_mut_", REPLICATE_ID, ".csv"), row.names = FALSE)
+}
+
+cat("\n=== REPLICATE", REPLICATE_ID, "COMPLETE ===\n")
+cat("Files saved:\n")
+cat("- outcomes_", REPLICATE_ID, ".csv\n")
+cat("- summary_", REPLICATE_ID, ".csv\n")
+cat("- diversity_", REPLICATE_ID, ".csv\n")
+cat("- mutations_", REPLICATE_ID, ".csv (with alpha mutation types)\n")
+cat("- clone_trajectories_", REPLICATE_ID, ".csv (NEW - for meta-analysis)\n")
+cat("- clone_trajectories_no_mut_", REPLICATE_ID, ".csv (NEW - for comparison)\n")
+cat("- alpha_matrix_", REPLICATE_ID, ".csv (with replicate ID)\n")
+cat("- timeseries_with_mut_", REPLICATE_ID, ".csv\n")
+cat("- timeseries_no_mut_", REPLICATE_ID, ".csv\n")
+
+cat("\nFinal summary:\n")
+cat("With mutations - Extinctions:", sum(outcomes_with_mut$extinct), "/", NSPP, "\n")
+cat("No mutations - Extinctions:", sum(outcomes_no_mut$extinct), "/", NSPP, "\n")
+cat("Total mutations:", nrow(sim_with_mut$mutation_events), "\n")
+
+# ENHANCED: Report alpha mutation breakdown
+if (nrow(sim_with_mut$mutation_events) > 0) {
+  alpha_breakdown <- sim_with_mut$mutation_events %>%
+    filter(channel == "alpha") %>%
+    count(alpha_mutation_type) %>%
+    mutate(prop = n / sum(n))
+  
+  cat("Alpha mutations:\n")
+  for (i in 1:nrow(alpha_breakdown)) {
+    cat(sprintf("  %s: %d (%.1f%%)\n", 
+                alpha_breakdown$alpha_mutation_type[i], 
+                alpha_breakdown$n[i], 
+                alpha_breakdown$prop[i] * 100))
+  }
+}
+
+# QUALITY CHECK: Verify all required files for meta-analysis
+required_files <- c(
+  paste0("outcomes_", REPLICATE_ID, ".csv"),
+  paste0("clone_trajectories_", REPLICATE_ID, ".csv"),
+  paste0("mutations_", REPLICATE_ID, ".csv"),
+  paste0("alpha_matrix_", REPLICATE_ID, ".csv")
+)
+
+cat("\nQuality check - Required files for meta-analysis:\n")
+for (file in required_files) {
+  if (file.exists(file)) {
+    file_size <- file.size(file)
+    cat("✓", file, "-", round(file_size/1024, 2), "KB\n")
+  } else {
+    cat("✗ MISSING:", file, "\n")
+  }
+}
+EOF
+
+# Run the R simulation
+echo "Starting R simulation for replicate $REPLICATE_ID"
+if Rscript eco_evo_single_run.R > sim_log_${REPLICATE_ID}.txt 2>&1; then
+    echo "Replicate $REPLICATE_ID completed successfully"
+    
+    # CORRECTED: More conservative cleanup - keep trajectory files
+    rm -f *.svg *heatmap* *detailed* sim_log_${REPLICATE_ID}.txt eco_evo_single_run.R
+    # Do NOT remove trajectory files - meta-analysis needs them
+    
+    # Verify we have the key files before compressing
+    if [[ -f "outcomes_${REPLICATE_ID}.csv" && -f "clone_trajectories_${REPLICATE_ID}.csv" ]]; then
+        # Compress results
+        tar -czf results_${REPLICATE_ID}.tar.gz *.csv
+        echo "Results successfully compressed for replicate $REPLICATE_ID"
+    else
+        echo "WARNING: Missing key files for replicate $REPLICATE_ID"
+        ls -la *.csv
+    fi
+    
+else
+    echo "ERROR: Replicate $REPLICATE_ID failed"
+    cat sim_log_${REPLICATE_ID}.txt
+    exit 1
+fi
+
+echo "Replicate $REPLICATE_ID complete at $(date)"
